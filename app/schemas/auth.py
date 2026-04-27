@@ -19,6 +19,8 @@ class UserResponse(BaseModel):
     id: int
     phone_number: str
     full_name: str
+    profile_id: Optional[str] = None
+    profile_name: Optional[str] = None
     created_at: Optional[str] = None
 
 
