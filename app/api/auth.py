@@ -1,3 +1,4 @@
+import base64
 import requests
 import logging
 from datetime import datetime, timezone
@@ -5,6 +6,8 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.config import Config
 from app.core.security import SecurityManager, get_current_user
@@ -29,18 +32,83 @@ def _short(value: str, head: int = 8) -> str:
     return value[:head] if value else "nil"
 
 
-def _decode_upstream_claims_without_signature(id_token: str) -> dict:
-    # NOTE: For full production hardening, verify RS256 signature via JWKS/public key.
-    # This demo implementation validates critical claims while trusting backend-to-backend transport.
+def _base64url_to_int(value: str) -> int:
+    padded = value + "=" * (-len(value) % 4)
+    return int.from_bytes(base64.urlsafe_b64decode(padded), "big")
+
+
+def _jwk_to_public_key_pem(jwk_data: dict) -> str:
+    public_numbers = rsa.RSAPublicNumbers(
+        e=_base64url_to_int(jwk_data["e"]),
+        n=_base64url_to_int(jwk_data["n"]),
+    )
+    public_key = public_numbers.public_key()
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+
+def _fetch_super_app_jwks() -> dict:
+    logger.info("[OIDC][Verify] Fetching JWKS from %s...", Config.SUPER_APP_JWKS_URL)
+    response = requests.get(Config.SUPER_APP_JWKS_URL, timeout=15)
+    response.raise_for_status()
+    jwks = response.json()
+    key_count = len(jwks.get("keys", []))
+    logger.info("[OIDC][Verify] ✓ JWKS fetched successfully, keys_count=%d", key_count)
+    for key in jwks.get("keys", []):
+        logger.info("[OIDC][Verify]   Available key: kid=%s alg=%s kty=%s", 
+                   key.get("kid", "unknown"), 
+                   key.get("alg", "unknown"),
+                   key.get("kty", "unknown"))
+    return jwks
+
+
+def _resolve_public_key_pem(kid: str) -> str:
+    logger.info("[OIDC][Verify] Resolving public key from JWK with kid=%s...", kid)
+    jwks = _fetch_super_app_jwks()
+    key_data = next(
+        (item for item in jwks.get("keys", []) if item.get("kid") == kid and item.get("kty") == "RSA"),
+        None,
+    )
+    if not key_data:
+        logger.error("[OIDC][Verify] ✗ No JWK found for kid=%s (available: %s)",
+                    kid,
+                    [k.get("kid") for k in jwks.get("keys", [])])
+        raise ValueError(f"No matching JWK found for kid={kid}")
+    logger.info("[OIDC][Verify] ✓ Found JWK for kid=%s, converting to PEM...", kid)
+    pem = _jwk_to_public_key_pem(key_data)
+    logger.info("[OIDC][Verify] ✓ Public key PEM ready for verification")
+    return pem
+
+
+def _decode_upstream_claims_with_signature(id_token: str) -> dict:
+    logger.info("[OIDC][Verify] Starting JWT signature verification...")
+    header = jwt.get_unverified_header(id_token)
+    kid = header.get("kid")
+    logger.info("[OIDC][Verify] JWT header: kid=%s alg=%s", kid, header.get("alg"))
+    
+    if not kid:
+        logger.error("[OIDC][Verify] ✗ Missing kid in JWT header")
+        raise ValueError("Missing kid in upstream id_token header")
+
+    logger.info("[OIDC][Verify] Resolving public key...")
+    public_key_pem = _resolve_public_key_pem(kid)
+    
+    logger.info("[OIDC][Verify] Verifying RS256 signature against SuperApp issuer (%s)...", Config.SUPER_APP_ISSUER)
     claims = jwt.decode(
         id_token,
-        options={
-            "verify_signature": False,
-            "verify_exp": False,
-            "verify_aud": False,
-        },
-        algorithms=["RS256", "HS256"],
+        public_key_pem,
+        algorithms=["RS256"],
+        audience=Config.SERVICE_APP_CLIENT_ID,
+        issuer=Config.SUPER_APP_ISSUER,
     )
+    logger.info("[OIDC][Verify] ✓ JWT signature verified! iss=%s sub_len=%d aud=%s profile_id=%s exp=%s",
+                claims.get("iss"),
+                len(str(claims.get("sub", ""))) if claims.get("sub") else 0,
+                claims.get("aud"),
+                claims.get("profile_id", "N/A"),
+                claims.get("exp"))
     return claims
 
 
@@ -140,9 +208,9 @@ def oidc_token_exchange(payload: OIDCTokenExchangeRequest, db: Session = Depends
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Upstream missing id_token")
 
     try:
-        claims = _decode_upstream_claims_without_signature(id_token)
+        claims = _decode_upstream_claims_with_signature(id_token)
     except Exception as exc:
-        logger.exception("[SSO][NetflixBE][TokenProxy] status=failed reason=decode_id_token")
+        logger.error("[OIDC][Verify] ✗ JWT signature verification failed: %s (type=%s)", exc, type(exc).__name__)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Invalid id_token: {exc}")
 
     subject = claims.get("sub")
